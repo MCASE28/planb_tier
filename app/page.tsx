@@ -1,159 +1,309 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
-import { Copy, Settings, Users, LogOut, CheckCircle, AlertCircle, RefreshCw } from 'lucide-react';
+import { Copy, Settings, Users, LogOut, CheckCircle, AlertCircle, RefreshCw, Shield, Eye, EyeOff } from 'lucide-react';
+import { supabase } from '../lib/supabase';
+import { toast } from 'sonner';
+
+// DB Types (Simplified)
+type Room = {
+  id: string;
+  access_code: string;
+  is_active: boolean;
+  max_players: number;
+  host_joined: boolean;
+};
+
+type Player = {
+  id: string;
+  name: string;
+  room_id: string;
+};
 
 export default function PlanBGame() {
-  // --- States ---
-  const [isHost, setIsHost] = useState(false);
-  const [showHostLogin, setShowHostLogin] = useState(true);
+  // --- Global / Data States ---
+  const [loading, setLoading] = useState(true);
+  const [room, setRoom] = useState<Room | null>(null);
+  const [players, setPlayers] = useState<Player[]>([]);
+  
+  // --- UI States ---
+  // 'loading' | 'host_login' (when no host) | 'player_entry' (when host exists) | 'lobby' (joined) | 'host_dashboard'
+  const [uiState, setUiState] = useState<'loading' | 'host_login' | 'player_entry' | 'lobby' | 'host_dashboard' | 'full'>('loading');
+  
+  // Inputs
   const [hostPassword, setHostPassword] = useState('');
-  
-  const [roomOpen, setRoomOpen] = useState(false);
-  const [maxPlayers, setMaxPlayers] = useState(4);
-  const [accessCode, setAccessCode] = useState('');
-  const [players, setPlayers] = useState<string[]>([]);
-  
-  // Player side states
   const [playerInputCode, setPlayerInputCode] = useState('');
   const [playerName, setPlayerName] = useState('');
-  const [entryStep, setEntryStep] = useState<'code' | 'name' | 'waiting' | 'full'>('code');
-
-  // --- Logic ---
+  const [playerEntryStep, setPlayerEntryStep] = useState<'code' | 'name'>('code');
   
-  // 4자리 16진수 생성
-  const generateCode = () => {
-    const code = Math.floor(Math.random() * 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
-    setAccessCode(code);
-  };
+  // Host Dashboard UI
+  const [showCode, setShowCode] = useState(false); // To toggle **** vs 1234
 
+  // --- 1. Initial Load & Realtime Subscription ---
   useEffect(() => {
-    generateCode();
+    fetchRoomStatus();
+
+    // Subscribe to Room changes
+    const roomChannel = supabase
+      .channel('room-changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms' }, (payload) => {
+        const newRoom = payload.new as Room;
+        setRoom(newRoom);
+        handleRoomStateChange(newRoom, players.length);
+      })
+      .subscribe();
+
+    // Subscribe to Player changes
+    const playerChannel = supabase
+      .channel('player-changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'players' }, () => {
+        fetchPlayers(); // Simply refetch list on change for simplicity
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(roomChannel);
+      supabase.removeChannel(playerChannel);
+    };
   }, []);
 
-  // 호스트 로그인
-  const handleHostLogin = () => {
-    if (hostPassword === '1234') {
-      setIsHost(true);
-      setShowHostLogin(false);
-    } else {
-      alert('비밀번호가 틀렸습니다.');
+  // --- Logic Helpers ---
+
+  const fetchRoomStatus = async () => {
+    try {
+      setLoading(true);
+      // Get the single room (assuming 1 room for this MVP)
+      const { data: rooms, error } = await supabase.from('rooms').select('*').limit(1);
+      
+      if (error) throw error;
+
+      if (rooms && rooms.length > 0) {
+        const currentRoom = rooms[0];
+        setRoom(currentRoom);
+        
+        // Also fetch players
+        const { data: currentPlayers } = await supabase.from('players').select('*').eq('room_id', currentRoom.id);
+        const pList = currentPlayers || [];
+        setPlayers(pList);
+
+        handleRoomStateChange(currentRoom, pList.length);
+      } else {
+        // No room found? Create one strictly if not exists (Edge case)
+        console.error("No room found in DB. Please run SQL setup.");
+      }
+    } catch (err) {
+      console.error(err);
+      toast.error("Failed to connect to server.");
+    } finally {
+      setLoading(false);
     }
   };
 
-  // 플레이어 코드 확인
-  const verifyAccessCode = () => {
-    if (playerInputCode.toUpperCase() === accessCode) {
-      if (players.length >= maxPlayers) {
-        setEntryStep('full');
+  const fetchPlayers = async () => {
+    if (!room) return;
+    const { data } = await supabase.from('players').select('*').eq('room_id', room.id);
+    if (data) {
+      setPlayers(data);
+      // Re-evaluate full state if needed
+      if (uiState === 'player_entry' && data.length >= room.max_players) {
+        setUiState('full');
+      } else if (uiState === 'full' && data.length < room.max_players) {
+        setUiState('player_entry');
+      }
+    }
+  };
+
+  // Determine which screen to show based on Room State
+  const handleRoomStateChange = (currentRoom: Room, playerCount: number) => {
+    // If I am already logged in as Host or Player, don't kick me out logic strictly here
+    // But for initial load:
+    
+    // We need a local flag to know if "I" am the host. 
+    // Since this is a simple browser-based session, we rely on local UI state for "am I host".
+    // But for "Initial View", we check server state.
+
+    setUiState(prev => {
+      if (prev === 'host_dashboard' || prev === 'lobby') return prev; // Stay if already in
+
+      if (currentRoom.host_joined) {
+        if (playerCount >= currentRoom.max_players) return 'full';
+        return 'player_entry';
       } else {
-        setEntryStep('name');
+        return 'host_login';
+      }
+    });
+  };
+
+  // --- Actions ---
+
+  const handleHostLogin = async () => {
+    if (hostPassword === '1234') {
+      if (!room) return;
+
+      // Update DB: Host has joined
+      const { error } = await supabase
+        .from('rooms')
+        .update({ host_joined: true, is_active: true }) // Auto activate
+        .eq('id', room.id);
+
+      if (error) {
+        toast.error("Error logging in as host");
+      } else {
+        setUiState('host_dashboard');
+        toast.success("Welcome, Host!");
       }
     } else {
-      alert('잘못된 코드입니다.');
+      toast.error("Wrong password");
     }
   };
 
-  // 플레이어 이름 등록
-  const joinGame = () => {
-    if (!playerName.trim()) return;
-    if (players.length >= maxPlayers) {
-      setEntryStep('full');
-      return;
+  const handleHostLogout = async () => {
+    if (!room) return;
+    const confirm = window.confirm("Are you sure? This will reset the room.");
+    if (confirm) {
+      // Reset room state
+      await supabase.from('rooms').update({ host_joined: false, is_active: false, access_code: '0000' }).eq('id', room.id);
+      await supabase.from('players').delete().eq('room_id', room.id); // Kick all players
+      setUiState('host_login');
+      setHostPassword('');
     }
-    setPlayers(prev => [...prev, playerName]);
-    setEntryStep('waiting');
   };
 
-  const copyCode = () => {
-    navigator.clipboard.writeText(accessCode);
-    alert('코드가 클립보드에 복사되었습니다.');
+  const handlePlayerVerifyCode = () => {
+    if (!room) return;
+    if (playerInputCode.toUpperCase() === room.access_code) {
+      setPlayerEntryStep('name');
+    } else {
+      toast.error("Invalid Code");
+    }
   };
 
-  // --- UI Components ---
+  const handlePlayerJoin = async () => {
+    if (!playerName.trim() || !room) return;
 
-  // 1. 초기 호스트 비밀번호 입력창 (화면 중앙)
-  if (showHostLogin && !roomOpen) {
+    const { error } = await supabase
+      .from('players')
+      .insert([{ room_id: room.id, name: playerName }]);
+
+    if (error) {
+      toast.error("Failed to join. Try again.");
+    } else {
+      setUiState('lobby');
+      toast.success("Joined successfully!");
+    }
+  };
+
+  const generateNewCode = async () => {
+    if (!room) return;
+    const code = Math.floor(Math.random() * 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
+    await supabase.from('rooms').update({ access_code: code }).eq('id', room.id);
+    toast.success("New Access Code Generated");
+  };
+
+  const toggleRoomOpen = async () => {
+    if (!room) return;
+    await supabase.from('rooms').update({ is_active: !room.is_active }).eq('id', room.id);
+  };
+
+  const updateMaxPlayers = async (num: number) => {
+    if (!room) return;
+    await supabase.from('rooms').update({ max_players: num }).eq('id', room.id);
+  };
+
+  const copyCodeToClipboard = () => {
+    if (!room) return;
+    navigator.clipboard.writeText(room.access_code);
+    toast.success("Code copied to clipboard!");
+  };
+
+  // --- UI Renders ---
+
+  if (loading) {
+    return <div className="min-h-screen bg-[#0f172a] flex items-center justify-center text-white">Loading...</div>;
+  }
+
+  // 1. Host Login (When no host exists on server)
+  if (uiState === 'host_login') {
     return (
-      <div className="fixed inset-0 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm z-50">
-        <div className="bg-white p-8 rounded-3xl shadow-2xl w-full max-w-sm border border-slate-100">
-          <h2 className="text-2xl font-black text-slate-800 mb-6 text-center">ADMIN ACCESS</h2>
+      <div className="min-h-screen flex items-center justify-center bg-[#0f172a] p-4">
+        <div className="bg-[#1e293b] p-8 rounded-3xl shadow-2xl w-full max-w-sm border border-slate-700">
+          <div className="text-center mb-8">
+            <h2 className="text-2xl font-black text-white mb-2">HOST ACCESS</h2>
+            <p className="text-slate-400 text-sm">Be the first to start the session.</p>
+          </div>
           <input 
             type="password" 
-            placeholder="호스트 비밀번호" 
-            className="w-full p-4 bg-slate-50 border-2 border-slate-100 rounded-2xl mb-4 focus:border-blue-500 outline-none transition-all text-center"
+            placeholder="Host Password" 
+            className="w-full p-4 bg-[#0f172a] border-2 border-slate-700 rounded-2xl mb-4 text-white focus:border-cyan-500 outline-none transition-all text-center placeholder:text-slate-600"
             value={hostPassword}
             onChange={(e) => setHostPassword(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleHostLogin()}
           />
           <button 
             onClick={handleHostLogin}
-            className="w-full bg-blue-600 text-white p-4 rounded-2xl font-bold hover:bg-blue-700 transition-all shadow-lg shadow-blue-200"
+            className="w-full bg-cyan-600 text-white p-4 rounded-2xl font-bold hover:bg-cyan-500 transition-all shadow-lg shadow-cyan-900/50"
           >
-            관리자 모드 진입
+            Start Session
           </button>
         </div>
       </div>
     );
   }
 
-  // 2. 플레이어 입장 화면 (호스트가 ON을 켰을 때)
-  if (!isHost && roomOpen) {
+  // 2. Room Full Screen
+  if (uiState === 'full') {
     return (
-      <div className="min-h-screen flex items-center justify-center p-6 bg-blue-50">
-        <div className="bg-white p-8 rounded-3xl shadow-xl w-full max-w-md border border-blue-100">
-          {entryStep === 'code' && (
+      <div className="min-h-screen flex items-center justify-center bg-[#0f172a] p-4">
+        <div className="text-center p-10 bg-[#1e293b] rounded-3xl border border-red-900/50">
+          <div className="w-20 h-20 bg-red-900/20 rounded-full flex items-center justify-center mx-auto mb-6 border border-red-800">
+            <AlertCircle className="w-10 h-10 text-red-500" />
+          </div>
+          <h2 className="text-2xl font-bold text-white mb-2">Room Full</h2>
+          <p className="text-slate-400">Please wait for the next session.</p>
+        </div>
+      </div>
+    );
+  }
+
+  // 3. Player Entry (When host exists)
+  if (uiState === 'player_entry') {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center p-6 bg-[#0f172a]">
+        <div className="bg-[#1e293b] p-8 rounded-3xl shadow-xl w-full max-w-md border border-slate-700">
+          <div className="text-center mb-8">
+            <h1 className="text-3xl font-black text-white mb-2 tracking-tight">PLANB <span className="text-cyan-500">TIER</span></h1>
+            <p className="text-slate-400 text-sm">Join the game session</p>
+          </div>
+
+          {playerEntryStep === 'code' && (
             <div className="text-center">
-              <h2 className="text-2xl font-bold text-slate-800 mb-2">게임 입장</h2>
-              <p className="text-slate-500 mb-8 text-sm">호스트가 제공한 4자리 코드를 입력하세요.</p>
               <input 
                 type="text" 
                 maxLength={4}
-                placeholder="0000"
-                className="w-full p-5 bg-slate-50 border-2 border-slate-100 rounded-2xl mb-6 text-center text-4xl font-mono font-black tracking-[0.5em] text-blue-600 focus:border-blue-400 outline-none uppercase"
+                placeholder="CODE"
+                className="w-full p-5 bg-[#0f172a] border-2 border-slate-700 rounded-2xl mb-6 text-center text-4xl font-mono font-black tracking-[0.5em] text-cyan-400 focus:border-cyan-500 outline-none uppercase placeholder:text-slate-800 transition-colors"
                 value={playerInputCode}
                 onChange={(e) => setPlayerInputCode(e.target.value)}
               />
-              <button onClick={verifyAccessCode} className="w-full bg-slate-800 text-white p-4 rounded-2xl font-bold hover:bg-slate-900 transition-all">
-                코드 확인
+              <button onClick={handlePlayerVerifyCode} className="w-full bg-slate-700 text-white p-4 rounded-2xl font-bold hover:bg-slate-600 transition-all border border-slate-600">
+                Verify Code
               </button>
             </div>
           )}
 
-          {entryStep === 'name' && (
+          {playerEntryStep === 'name' && (
             <div className="text-center">
-              <h2 className="text-2xl font-bold text-slate-800 mb-2">이름 설정</h2>
-              <p className="text-slate-500 mb-8 text-sm">슬롯에 등록될 이름을 입력해주세요.</p>
+              <h2 className="text-xl font-bold text-white mb-2">Identify Yourself</h2>
               <input 
                 type="text" 
-                placeholder="닉네임 입력"
-                className="w-full p-4 bg-slate-50 border-2 border-slate-100 rounded-2xl mb-6 text-center text-xl font-bold outline-none focus:border-blue-400"
+                placeholder="Nickname"
+                className="w-full p-4 bg-[#0f172a] border-2 border-slate-700 rounded-2xl mb-6 text-center text-xl font-bold text-white outline-none focus:border-cyan-500"
                 value={playerName}
                 onChange={(e) => setPlayerName(e.target.value)}
               />
-              <button onClick={joinGame} className="w-full bg-blue-600 text-white p-4 rounded-2xl font-bold hover:bg-blue-700 transition-all">
-                참여 확정
+              <button onClick={handlePlayerJoin} className="w-full bg-cyan-600 text-white p-4 rounded-2xl font-bold hover:bg-cyan-500 transition-all shadow-lg shadow-cyan-900/50">
+                Join Lobby
               </button>
-            </div>
-          )}
-
-          {entryStep === 'waiting' && (
-            <div className="text-center py-10">
-              <div className="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-6">
-                <CheckCircle className="w-10 h-10 text-green-600" />
-              </div>
-              <h2 className="text-2xl font-bold text-slate-800 mb-2">등록 완료!</h2>
-              <p className="text-slate-500">호스트가 게임을 시작할 때까지<br/>잠시만 기다려주세요.</p>
-            </div>
-          )}
-
-          {entryStep === 'full' && (
-            <div className="text-center py-10">
-              <div className="w-20 h-20 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-6">
-                <AlertCircle className="w-10 h-10 text-red-600" />
-              </div>
-              <h2 className="text-2xl font-bold text-slate-800 mb-2">참여 마감</h2>
-              <p className="text-slate-500">죄송합니다. 모든 슬롯이 꽉 찼습니다.</p>
             </div>
           )}
         </div>
@@ -161,104 +311,127 @@ export default function PlanBGame() {
     );
   }
 
-  // 3. 호스트 대시보드
-  return (
-    <div className="max-w-5xl mx-auto p-6 lg:p-12">
-      <header className="flex justify-between items-center mb-12">
-        <div>
-          <h1 className="text-4xl font-black text-slate-900 tracking-tight">PLANB <span className="text-blue-600">TIER</span></h1>
-          <p className="text-slate-500 font-medium">Host Management System</p>
-        </div>
-        <button 
-          onClick={() => {setIsHost(false); setShowHostLogin(true);}} 
-          className="p-3 text-slate-400 hover:text-red-500 transition-colors"
-        >
-          <LogOut className="w-6 h-6" />
-        </button>
-      </header>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* 플레이어 현황 */}
-        <div className="lg:col-span-2 space-y-6">
-          <div className="bg-white p-8 rounded-[2.5rem] shadow-sm border border-slate-100">
-            <div className="flex justify-between items-center mb-8">
-              <h3 className="text-xl font-bold flex items-center gap-2">
-                <Users className="w-6 h-6 text-blue-500" />
-                접속 플레이어 <span className="text-slate-300 ml-2">{players.length}/{maxPlayers}</span>
-              </h3>
+  // 4. Lobby (Player Waiting)
+  if (uiState === 'lobby') {
+    return (
+        <div className="min-h-screen flex items-center justify-center p-6 bg-[#0f172a]">
+             <div className="bg-[#1e293b] p-10 rounded-3xl shadow-xl w-full max-w-md border border-slate-700 text-center">
+              <div className="w-24 h-24 bg-green-900/30 rounded-full flex items-center justify-center mx-auto mb-6 border border-green-900 animate-pulse">
+                <CheckCircle className="w-12 h-12 text-green-500" />
+              </div>
+              <h2 className="text-2xl font-bold text-white mb-2">You're In!</h2>
+              <p className="text-slate-400 mb-8">Waiting for host to start...</p>
+              <div className="bg-[#0f172a] p-4 rounded-xl border border-slate-700">
+                <span className="text-xs font-bold text-slate-500 block mb-1">YOUR ID</span>
+                <span className="text-xl font-bold text-cyan-400">{playerName}</span>
+              </div>
             </div>
-            
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {Array.from({ length: maxPlayers }).map((_, i) => (
-                <div key={i} className={`p-4 rounded-2xl border-2 flex items-center justify-between transition-all ${players[i] ? 'border-blue-100 bg-blue-50/50' : 'border-dashed border-slate-100'}`}>
-                  <span className="text-xs font-bold text-slate-400">SLOT {String(i+1).padStart(2, '0')}</span>
-                  <span className={`font-bold ${players[i] ? 'text-blue-700' : 'text-slate-300'}`}>
-                    {players[i] || 'Waiting...'}
-                  </span>
-                </div>
-              ))}
+        </div>
+    )
+  }
+
+  // 5. Host Dashboard
+  if (uiState === 'host_dashboard' && room) {
+    return (
+      <div className="min-h-screen bg-[#0f172a] text-slate-200 p-6 lg:p-12">
+        <header className="flex justify-between items-center mb-12">
+          <div>
+            <h1 className="text-4xl font-black text-white tracking-tight">PLANB <span className="text-cyan-500">TIER</span></h1>
+            <p className="text-slate-500 font-medium">Host Dashboard</p>
+          </div>
+          <button 
+            onClick={handleHostLogout}
+            className="p-3 text-slate-500 hover:text-red-400 transition-colors bg-[#1e293b] rounded-xl border border-slate-800"
+          >
+            <LogOut className="w-6 h-6" />
+          </button>
+        </header>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          {/* Players Grid */}
+          <div className="lg:col-span-2 space-y-6">
+            <div className="bg-[#1e293b] p-8 rounded-[2.5rem] shadow-sm border border-slate-700">
+              <div className="flex justify-between items-center mb-8">
+                <h3 className="text-xl font-bold flex items-center gap-2 text-white">
+                  <Users className="w-6 h-6 text-cyan-500" />
+                  Players <span className="text-slate-500 ml-2">{players.length}/{room.max_players}</span>
+                </h3>
+              </div>
+              
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {Array.from({ length: room.max_players }).map((_, i) => (
+                  <div key={i} className={`p-4 rounded-2xl border-2 flex items-center justify-between transition-all ${players[i] ? 'border-cyan-900/50 bg-cyan-950/30' : 'border-dashed border-slate-700 bg-[#0f172a]'}`}>
+                    <span className="text-xs font-bold text-slate-500">SLOT {String(i+1).padStart(2, '0')}</span>
+                    <span className={`font-bold ${players[i] ? 'text-cyan-400' : 'text-slate-600'}`}>
+                      {players[i]?.name || 'Empty'}
+                    </span>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
-        </div>
 
-        {/* 설정 패널 */}
-        <div className="space-y-6">
-          <div className="bg-slate-900 text-white p-8 rounded-[2.5rem] shadow-xl">
-            <h3 className="text-xl font-bold mb-8 flex items-center gap-2">
-              <Settings className="w-6 h-6 text-blue-400" />
-              Room Settings
-            </h3>
-            
-            <div className="space-y-6">
-              <div>
-                <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-3">Player Limit</label>
-                <select 
-                  className="w-full bg-slate-800 border-none rounded-xl p-3 text-white focus:ring-2 focus:ring-blue-500"
-                  value={maxPlayers}
-                  onChange={(e) => setMaxPlayers(Number(e.target.value))}
-                >
-                  {[2, 4, 8, 16, 32].map(num => <option key={num} value={num}>{num} Players</option>)}
-                </select>
-              </div>
+          {/* Settings Panel */}
+          <div className="space-y-6">
+            <div className="bg-slate-950 text-white p-8 rounded-[2.5rem] shadow-xl border border-slate-800">
+              <h3 className="text-xl font-bold mb-8 flex items-center gap-2">
+                <Settings className="w-6 h-6 text-cyan-400" />
+                Control
+              </h3>
+              
+              <div className="space-y-6">
+                <div>
+                  <label className="text-xs font-bold text-slate-500 uppercase tracking-widest block mb-3">Player Limit</label>
+                  <select 
+                    className="w-full bg-[#1e293b] border border-slate-700 rounded-xl p-3 text-white focus:ring-2 focus:ring-cyan-500 outline-none"
+                    value={room.max_players}
+                    onChange={(e) => updateMaxPlayers(Number(e.target.value))}
+                  >
+                    {[2, 4, 8, 16, 32].map(num => <option key={num} value={num}>{num} Players</option>)}
+                  </select>
+                </div>
 
-              <div className="p-5 bg-slate-800 rounded-2xl relative overflow-hidden group">
-                <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Access Code</label>
-                <div className="flex items-center justify-between">
-                  <span className="text-3xl font-mono font-black text-blue-400 tracking-widest">{accessCode}</span>
-                  <div className="flex gap-2">
-                    <button onClick={generateCode} className="p-2 hover:bg-slate-700 rounded-lg transition-colors">
-                      <RefreshCw className="w-5 h-5 text-slate-400" />
-                    </button>
-                    <button onClick={copyCode} className="p-2 hover:bg-slate-700 rounded-lg transition-colors">
-                      <Copy className="w-5 h-5 text-slate-400" />
-                    </button>
+                <div className="p-5 bg-[#0f172a] rounded-2xl relative overflow-hidden group border border-slate-800">
+                  <label className="text-xs font-bold text-slate-500 uppercase tracking-widest block mb-2">Access Code</label>
+                  <div className="flex items-center justify-between">
+                    <span className="text-3xl font-mono font-black text-cyan-400 tracking-widest">
+                      {showCode ? room.access_code : '****'}
+                    </span>
+                    <div className="flex gap-2">
+                      <button onClick={() => setShowCode(!showCode)} className="p-2 hover:bg-slate-800 rounded-lg transition-colors">
+                        {showCode ? <EyeOff className="w-5 h-5 text-slate-400"/> : <Eye className="w-5 h-5 text-slate-400"/>}
+                      </button>
+                      <button onClick={generateNewCode} className="p-2 hover:bg-slate-800 rounded-lg transition-colors">
+                        <RefreshCw className="w-5 h-5 text-slate-400" />
+                      </button>
+                      <button onClick={copyCodeToClipboard} className="p-2 hover:bg-slate-800 rounded-lg transition-colors">
+                        <Copy className="w-5 h-5 text-slate-400" />
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
           </div>
         </div>
-      </div>
 
-      {/* 우측 하단 ON/OFF 토글 컨트롤 */}
-      <div className="fixed bottom-10 right-10 flex flex-col items-end gap-4">
-        {roomOpen && (
-          <div className="bg-blue-600 text-white text-xs font-black px-4 py-2 rounded-full shadow-lg animate-bounce uppercase tracking-tighter">
-            Players can join now
+        {/* Toggle Room Open/Closed */}
+        <div className="fixed bottom-10 right-10 flex flex-col items-end gap-4">
+          <div className="bg-[#1e293b] p-4 rounded-3xl shadow-2xl border border-slate-700 flex items-center gap-4">
+            <span className={`text-sm font-black transition-colors ${room.is_active ? 'text-cyan-500' : 'text-slate-500'}`}>
+              {room.is_active ? 'ROOM OPEN' : 'ROOM CLOSED'}
+            </span>
+            <button 
+              onClick={toggleRoomOpen}
+              className={`w-16 h-9 rounded-full relative transition-all duration-300 ${room.is_active ? 'bg-cyan-600' : 'bg-slate-700'}`}
+            >
+              <div className={`absolute top-1 w-7 h-7 bg-white rounded-full shadow-sm transition-all duration-300 ${room.is_active ? 'left-8' : 'left-1'}`} />
+            </button>
           </div>
-        )}
-        <div className="bg-white p-4 rounded-3xl shadow-2xl border border-slate-100 flex items-center gap-4">
-          <span className={`text-sm font-black transition-colors ${roomOpen ? 'text-blue-600' : 'text-slate-300'}`}>
-            {roomOpen ? 'ROOM OPEN' : 'ROOM OFF'}
-          </span>
-          <button 
-            onClick={() => setRoomOpen(!roomOpen)}
-            className={`w-16 h-9 rounded-full relative transition-all duration-300 ${roomOpen ? 'bg-blue-600' : 'bg-slate-200'}`}
-          >
-            <div className={`absolute top-1 w-7 h-7 bg-white rounded-full shadow-sm transition-all duration-300 ${roomOpen ? 'left-8' : 'left-1'}`} />
-          </button>
         </div>
       </div>
-    </div>
-  );
+    );
+  }
+
+  return null;
 }
