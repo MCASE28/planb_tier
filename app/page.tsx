@@ -115,20 +115,24 @@ export default function PlanBGame() {
 
   // Determine which screen to show based on Room State
   const handleRoomStateChange = (currentRoom: Room, playerCount: number) => {
-    // If I am already logged in as Host or Player, don't kick me out logic strictly here
-    // But for initial load:
-    
-    // We need a local flag to know if "I" am the host. 
-    // Since this is a simple browser-based session, we rely on local UI state for "am I host".
-    // But for "Initial View", we check server state.
-
     setUiState(prev => {
-      if (prev === 'host_dashboard' || prev === 'lobby') return prev; // Stay if already in
+      // 1. If we are already in a specific verified state, stay there unless kicked
+      if (prev === 'host_dashboard' || prev === 'lobby') return prev; 
+      
+      // 2. Check for persistent Host Session in LocalStorage
+      const isLocalHost = typeof window !== 'undefined' && localStorage.getItem('planb_is_host') === 'true';
 
+      // 3. Logic
       if (currentRoom.host_joined) {
+        // If the DB says host is joined...
+        if (isLocalHost) {
+          return 'host_dashboard'; // ...and WE are the host locally, restore dashboard
+        }
+        // ...otherwise we are a player
         if (playerCount >= currentRoom.max_players) return 'full';
         return 'player_entry';
       } else {
+        // No host in DB -> Go to login
         return 'host_login';
       }
     });
@@ -149,12 +153,25 @@ export default function PlanBGame() {
       if (error) {
         toast.error("Error logging in as host");
       } else {
+        // Save local persistent flag
+        localStorage.setItem('planb_is_host', 'true');
         setUiState('host_dashboard');
         toast.success("Welcome, Host!");
       }
     } else {
       toast.error("Wrong password");
     }
+  };
+  
+  // Special action for "Recover Host" when room says host_joined=true but local storage is empty
+  const handleHostRecovery = () => {
+      if (hostPassword === '1234') {
+          localStorage.setItem('planb_is_host', 'true');
+          setUiState('host_dashboard');
+          toast.success("Host session recovered!");
+      } else {
+          toast.error("Wrong password");
+      }
   };
 
   const handleHostLogout = async () => {
@@ -164,6 +181,10 @@ export default function PlanBGame() {
       // Reset room state
       await supabase.from('rooms').update({ host_joined: false, is_active: false, access_code: '0000' }).eq('id', room.id);
       await supabase.from('players').delete().eq('room_id', room.id); // Kick all players
+      
+      // Clear local persistence
+      localStorage.removeItem('planb_is_host');
+      
       setUiState('host_login');
       setHostPassword('');
     }
@@ -306,6 +327,24 @@ export default function PlanBGame() {
               </button>
             </div>
           )}
+          
+          <div className="mt-8 pt-6 border-t border-slate-800 text-center">
+              <button 
+                onClick={() => {
+                   const pwd = prompt("Enter Host Password to Recover Session:");
+                   if(pwd === '1234') {
+                       localStorage.setItem('planb_is_host', 'true');
+                       setUiState('host_dashboard');
+                       toast.success("Host recovered!");
+                   } else if (pwd) {
+                       toast.error("Wrong password");
+                   }
+                }}
+                className="text-xs text-slate-600 hover:text-slate-400 font-bold uppercase tracking-widest transition-colors"
+              >
+                  Admin / Host Recovery
+              </button>
+          </div>
         </div>
       </div>
     );
